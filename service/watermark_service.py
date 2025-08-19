@@ -7,6 +7,10 @@ from PIL import Image
 import logging
 import threading
 import time
+import tempfile
+import shutil
+import json
+import moviepy.editor as mp
 
 from preprocess_image import preprocess_image
 from inpaint_model import InpaintCAModel
@@ -21,6 +25,9 @@ class WatermarkRemovalService:
         self.model = None
         self.checkpoint_dir = 'model/'
         self._lock = threading.Lock()
+        self.sess = None
+        self.output_tensor = None
+        self.input_placeholder = None
         self._load_config()
         logger.info("WatermarkRemovalService initialized")
 
@@ -139,42 +146,113 @@ class WatermarkRemovalService:
 
                 # 加载视频
                 video = mp.VideoFileClip(input_path)
+                
+                # 调试信息：打印视频属性
+                logger.info(f"Video duration: {video.duration}")
+                logger.info(f"Video fps: {video.fps}")
+                logger.info(f"Video size: {video.size}")
+
+                # 尝试获取duration和fps，如果为None则使用备用方法
+                duration = video.duration
+                fps = video.fps
+                
+                # 如果moviepy无法获取fps，尝试使用opencv获取
+                if fps is None:
+                    try:
+                        import cv2
+                        cap = cv2.VideoCapture(input_path)
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        cap.release()
+                        logger.info(f"Using OpenCV fps: {fps}")
+                    except Exception as e:
+                        logger.warning(f"Failed to get fps from OpenCV: {e}")
+                        fps = 25.0  # 默认帧率
+                        logger.info(f"Using default fps: {fps}")
+                
+                # 如果moviepy无法获取duration，尝试计算
+                if duration is None:
+                    try:
+                        import cv2
+                        cap = cv2.VideoCapture(input_path)
+                        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                        fps_cv = cap.get(cv2.CAP_PROP_FPS)
+                        cap.release()
+                        if fps_cv > 0:
+                            duration = frame_count / fps_cv
+                            logger.info(f"Calculated duration: {duration}")
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate duration: {e}")
+
+                # 最终检查
+                if duration is None or duration <= 0:
+                    logger.error("Could not determine video duration")
+                    return False
+                    
+                if fps is None or fps <= 0:
+                    logger.error("Could not determine video fps")
+                    return False
 
                 # 检查视频长度限制（60秒）
-                if video.duration > 60:
+                if duration > 60:
                     logger.error("Video duration exceeds 60 seconds limit")
                     return False
 
                 # 创建临时目录处理帧
                 temp_dir = tempfile.mkdtemp()
 
+                # 初始化TensorFlow会话（只初始化一次）
+                tf.reset_default_graph()
+                sess_config = tf.ConfigProto()
+                sess_config.gpu_options.allow_growth = True
+
                 try:
-                    # 提取帧
-                    fps = video.fps
-                    frames = []
-                    total_frames = int(video.duration * fps)
+                    with tf.Session(config=sess_config) as sess:
+                        # 预加载模型（只加载一次）
+                        dummy_input = tf.placeholder(tf.float32, shape=[1, None, None, 6])
+                        output_tensor = self.model.build_server_graph(self.FLAGS, dummy_input)
+                        output_tensor = (output_tensor + 1.) * 127.5
+                        output_tensor = tf.reverse(output_tensor, [-1])
+                        output_tensor = tf.saturate_cast(output_tensor, tf.uint8)
 
-                    for i, frame in enumerate(video.iter_frames()):
-                        if task_id:
-                            self._update_progress(task_id, i / total_frames * 0.3)  # 30%用于提取帧
+                        # 加载预训练模型权重
+                        vars_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+                        assign_ops = []
+                        for var in vars_list:
+                            vname = var.name
+                            from_name = vname
+                            try:
+                                var_value = tf.contrib.framework.load_variable(
+                                    self.checkpoint_dir, from_name
+                                )
+                                assign_ops.append(tf.assign(var, var_value))
+                            except Exception as e:
+                                logger.warning(f"Could not load variable {vname}: {e}")
 
-                        # 保存帧为临时图片
-                        frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
-                        cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        sess.run(assign_ops)
+                        logger.info('Model loaded once for video processing')
 
-                        # 处理帧去水印
-                        processed_frame_path = os.path.join(temp_dir, f"processed_{i:06d}.png")
+                        # 提取和处理帧
+                        frames = []
+                        total_frames = int(duration * fps)
 
-                        # 使用现有的图片处理逻辑
-                        success = self._process_single_frame(frame_path, processed_frame_path, watermark_type)
-
-                        if success:
-                            frames.append(processed_frame_path)
+                        for i, frame in enumerate(video.iter_frames()):
                             if task_id:
-                                self._update_progress(task_id, 0.3 + (i / total_frames) * 0.6)  # 60%用于处理帧
-                        else:
-                            logger.warning(f"Failed to process frame {i}")
-                            frames.append(frame_path)  # 使用原帧
+                                self._update_progress(task_id, i / total_frames * 0.8)  # 80%用于处理帧
+
+                            # 保存帧为临时图片
+                            frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
+                            cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+                            # 处理帧去水印（复用已加载的模型）
+                            processed_frame_path = os.path.join(temp_dir, f"processed_{i:06d}.png")
+                            success = self._process_single_frame_with_session(
+                                frame_path, processed_frame_path, watermark_type, sess, dummy_input, output_tensor)
+
+                            if success:
+                                frames.append(processed_frame_path)
+                            else:
+                                logger.warning(f"Failed to process frame {i}")
+                                frames.append(frame_path)  # 使用原帧
 
                     # 重新组装视频
                     if task_id:
@@ -216,8 +294,70 @@ class WatermarkRemovalService:
             if input_image.shape == (0,):
                 return False
 
-            # 使用预加载的模型推理
-            result = self.sess.run(self.output_tensor, feed_dict={self.input_placeholder:input_image})
+            # 重置默认图并创建新会话 (和process_image方法相同的逻辑)
+            tf.reset_default_graph()
+            
+            # 创建会话配置
+            sess_config = tf.ConfigProto()
+            sess_config.gpu_options.allow_growth = True
+            
+            # 在会话中执行推理
+            with tf.Session(config=sess_config) as sess:
+                # 将输入图像转换为TensorFlow常量
+                input_image_tensor = tf.constant(input_image, dtype=tf.float32)
+                
+                # 构建服务器图
+                output = self.model.build_server_graph(self.FLAGS, input_image_tensor)
+                
+                # 后处理输出
+                output = (output + 1.) * 127.5
+                output = tf.reverse(output, [-1])
+                output = tf.saturate_cast(output, tf.uint8)
+                
+                # 加载预训练模型
+                vars_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+                assign_ops = []
+                for var in vars_list:
+                    vname = var.name
+                    from_name = vname
+                    try:
+                        var_value = tf.contrib.framework.load_variable(
+                            self.checkpoint_dir, from_name
+                        )
+                        assign_ops.append(tf.assign(var, var_value))
+                    except Exception as e:
+                        logger.warning(f"Could not load variable {vname}: {e}")
+                
+                # 运行变量赋值
+                sess.run(assign_ops)
+                
+                # 执行推理
+                result = sess.run(output)
+                
+                # 保存结果
+                cv2.imwrite(output_path, cv2.cvtColor(
+                    result[0][:, :, ::-1], cv2.COLOR_BGR2RGB
+                ))
+
+            return True
+        except Exception as e:
+            logger.error(f"Error processing frame: {e}")
+            return False
+
+    def _process_single_frame_with_session(self, input_path, output_path, watermark_type, sess, input_placeholder, output_tensor):
+        """
+        使用已有的TensorFlow会话处理单帧（避免重复加载模型）
+        """
+        try:
+            # 预处理图像
+            image = Image.open(input_path)
+            input_image = preprocess_image(image, watermark_type)
+
+            if input_image.shape == (0,):
+                return False
+
+            # 使用已有的会话执行推理
+            result = sess.run(output_tensor, feed_dict={input_placeholder: input_image})
 
             # 保存结果
             cv2.imwrite(output_path, cv2.cvtColor(
@@ -226,7 +366,7 @@ class WatermarkRemovalService:
 
             return True
         except Exception as e:
-            logger.error(f"Error processing frame: {e}")
+            logger.error(f"Error processing frame with session: {e}")
             return False
 
     def _update_progress(self, task_id, progress):
